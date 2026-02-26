@@ -103,6 +103,12 @@ const config = Object.freeze({
     nodeEnv  : get    ("NODE_ENV",    "development"),
   }),
 
+    /* ── 7. GitHub Auto-Updater ─────────────────────────────────────── */
+  github: Object.freeze({
+    repoUrl  : get    ("GITHUB_REPO_URL", ""),
+    branch   : get    ("GITHUB_BRANCH",   "main"),
+  }),
+
 });
 
 export default config;
