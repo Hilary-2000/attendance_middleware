@@ -26,6 +26,7 @@ module.exports = {
       cron_restart: "0 6-20 * * *",
       watch       : false,          // set true to auto-restart on file change
       autorestart : false,           // do not auto-restart
+      windowsHide : true,           // ← hide terminal popups on Windows
       max_restarts: 10,
       env: {
         NODE_ENV: "production",
@@ -46,6 +47,7 @@ module.exports = {
       cron_restart: "30 9 * * *",
       watch       : false,
       autorestart : false,          // don't auto-restart — only run on schedule
+      windowsHide : true,           // ← hide terminal popups on Windows
       env: {
         NODE_ENV: "production",
       },
