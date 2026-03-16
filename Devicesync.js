@@ -581,7 +581,7 @@ async function syncDevice(client, cloudPersons) {
         console.log(`     + Added  : ${empNo}  ${person.name}`);
 
         // Upload photo if flag is set
-        if (person.photo_update_flag === 1 && person.photo_url) {
+        if (person.photo_update_flag === 0 && person.photo_url) {
           const img = await fetchPhoto(person.photo_url);
           if (img) {
             await uploadFaceImage(client, empNo, img);
@@ -614,7 +614,7 @@ async function syncDevice(client, cloudPersons) {
         }
 
         // Update photo only when photo_update_flag = 1
-        if (person.photo_update_flag === 1 && person.photo_url) {
+        if (person.photo_update_flag === 0 && person.photo_url) {
           const img = await fetchPhoto(person.photo_url);
           if (img) {
             await uploadFaceImage(client, empNo, img);

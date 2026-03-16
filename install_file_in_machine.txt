@@ -1,0 +1,40 @@
+Install HIKVISION CLOUD UPDATER.
+
+1. Install Global Tools First
+npm install -g pm2
+npm install -g pm2-windows-startup
+
+2. Get the project from github
+:: Option A — from GitHub (recommended)
+git clone https://github.com/yourusername/hikvision-middleware.git
+cd hikvision-middleware
+
+:: Option B — from zip
+:: just extract the zip and cd into the folder
+
+3. Install Dependencies
+npm install
+
+4. Create Fresh Config files
+:: Copy the example and fill in real values
+copy .env.example .env
+:: Then open .env in Notepad and update:
+::   TERMINAL_HOST, TERMINAL_PASSWORD, SCHOOL_CODE etc.
+notepad .env
+
+5. Start PM2
+pm2 start ecosystem.config.cjs
+pm2 save
+
+6. Register PM2 to start on boot.
+pm2-startup install
+pm2 save
+
+7. Verify everything is running
+pm2 status
+pm2 logs
+
+8. Restart PM2
+pm2 delete all
+pm2 start ecosystem.config.cjs
+pm2 save
