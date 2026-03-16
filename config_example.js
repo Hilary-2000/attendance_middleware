@@ -71,6 +71,8 @@ const config = Object.freeze({
     apiKey              : get    ("CLOUD_API_KEY"),
     attendanceEndpoint      : get    ("CLOUD_ATTENDANCE_ENDPOINT",        "/attendance/sync"),
     staffAttendanceEndpoint : get    ("CLOUD_STAFF_ATTENDANCE_ENDPOINT", "/attendance/staff/sync"),
+    personSyncEndpoint      : get    ("CLOUD_PERSON_SYNC_ENDPOINT",       "/sims/ajax/administration/device_sync_persons.php"),
+    personFlagEndpoint      : get    ("CLOUD_PERSON_FLAG_ENDPOINT",       "/sims/ajax/administration/device_sync_persons.php"),
     timeoutMs           : getInt ("CLOUD_API_TIMEOUT_MS",        15000),
     batchSize           : getInt ("CLOUD_BATCH_SIZE",            50),
     retryAttempts       : getInt ("CLOUD_RETRY_ATTEMPTS",        3),
