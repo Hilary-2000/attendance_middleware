@@ -18,7 +18,8 @@
 
 import { HikvisionClient }                  from "./hikvisionClient.js";
 import { ensureDeviceReachable }            from "./deviceDiscovery.js";
-import { processAttendance, syncToCloud }   from "./attendanceProcessor.js";
+import { processAttendance, syncToCloud }         from "./attendanceProcessor.js";
+import { processStaffAttendance, syncStaffToCloud } from "./Staffattendanceprocessor.js";
 import config                               from "./config.js";
 
 /* ================================================================== */
@@ -139,30 +140,67 @@ async function main() {
 
   console.log(`  Pulled ${rawRecords.length} raw event(s) from terminal.\n`);
 
-  // ── 4. Process: filter → deduplicate → classify ──────────────────
-  console.log("▶ Processing attendance records …");
-  const processed = processAttendance(rawRecords);
+  // ── 4. Split records by biometric prefix ────────────────────────
+  //   Prefix "1" → students  → attendanceProcessor.js
+  //   Prefix "2" → staff     → staffAttendanceProcessor.js
+  //   Anything else           → ignored
+  const studentRaw = rawRecords.filter((r) =>
+    (r.employeeNo ?? "").trim().startsWith("1")
+  );
+  const staffRaw = rawRecords.filter((r) =>
+    (r.employeeNo ?? "").trim().startsWith("2")
+  );
 
-  if (processed.length === 0) {
-    console.log("  No valid records after processing — nothing to sync.\n");
-    return;
+  console.log(`  ${studentRaw.length} student event(s)  |  ${staffRaw.length} staff event(s)\n`);
+
+  // ── 5. Process students ───────────────────────────────────────────
+  console.log("▶ Processing student attendance …");
+  const processedStudents = processAttendance(studentRaw);
+
+  if (processedStudents.length > 0) {
+    console.log(`\n  ${processedStudents.length} student record(s):\n`);
+    processedStudents.forEach(printRecord);
+  } else {
+    console.log("  No valid student records after processing.\n");
   }
 
-  console.log(`\n  Processed ${processed.length} student record(s):\n`);
-  processed.forEach(printRecord);
+  // ── 6. Process staff ──────────────────────────────────────────────
+  console.log("▶ Processing staff attendance …");
+  const processedStaff = processStaffAttendance(staffRaw);
 
-  // ── 5. Sync to Cloud School System ───────────────────────────────
-  const { success, sent, response } = await syncToCloud(processed, dateStr);
-
-  if (success) {
-    console.log(`\n✔  Done. ${sent} record(s) sent to cloud successfully.`);
-    if (response) {
-      console.log("  Cloud response:", JSON.stringify(response, null, 2));
-    }
+  if (processedStaff.length > 0) {
+    console.log(`\n  ${processedStaff.length} staff record(s):\n`);
+    processedStaff.forEach((r) =>
+      console.log(`  • biometric_no: ${r.biometric_no}  |  time_in: ${r.time_in}${r.time_out ? `  |  time_out: ${r.time_out}` : ""}`)
+    );
   } else {
-    console.error("\n✖  Cloud sync failed. Records were NOT sent.");
-    console.error("   Check your CLOUD_API_BASE_URL and CLOUD_API_KEY in .env");
-    process.exit(1);
+    console.log("  No valid staff records after processing.\n");
+  }
+
+  // ── 7. Sync students to cloud ─────────────────────────────────────
+  if (processedStudents.length > 0) {
+    const { success, sent, response } = await syncToCloud(processedStudents, dateStr);
+    if (success) {
+      console.log(`\n✔  Students: ${sent} record(s) sent to cloud.`);
+      if (response) console.log("  Cloud response:", JSON.stringify(response, null, 2));
+    } else {
+      console.error("\n✖  Student sync failed.");
+    }
+  }
+
+  // ── 8. Sync staff to cloud ────────────────────────────────────────
+  if (processedStaff.length > 0) {
+    const { success, sent, response } = await syncStaffToCloud(processedStaff, dateStr);
+    if (success) {
+      console.log(`\n✔  Staff: ${sent} record(s) sent to cloud.`);
+      if (response) console.log("  Cloud response:", JSON.stringify(response, null, 2));
+    } else {
+      console.error("\n✖  Staff sync failed.");
+    }
+  }
+
+  if (processedStudents.length === 0 && processedStaff.length === 0) {
+    console.log("  No valid records to sync — nothing sent to cloud.\n");
   }
 }
 

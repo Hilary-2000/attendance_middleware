@@ -69,7 +69,8 @@ const config = Object.freeze({
     schoolCode          : get    ("SCHOOL_CODE"),
     baseUrl             : get    ("CLOUD_API_BASE_URL"),
     apiKey              : get    ("CLOUD_API_KEY"),
-    attendanceEndpoint  : get    ("CLOUD_ATTENDANCE_ENDPOINT",   "/attendance/sync"),
+    attendanceEndpoint      : get    ("CLOUD_ATTENDANCE_ENDPOINT",        "/attendance/sync"),
+    staffAttendanceEndpoint : get    ("CLOUD_STAFF_ATTENDANCE_ENDPOINT", "/attendance/staff/sync"),
     timeoutMs           : getInt ("CLOUD_API_TIMEOUT_MS",        15000),
     batchSize           : getInt ("CLOUD_BATCH_SIZE",            50),
     retryAttempts       : getInt ("CLOUD_RETRY_ATTEMPTS",        3),
@@ -103,12 +104,12 @@ const config = Object.freeze({
     nodeEnv  : get    ("NODE_ENV",    "development"),
   }),
 
-    /* ── 7. GitHub Auto-Updater ─────────────────────────────────────── */
+
+  /* ── 7. GitHub Auto-Updater ─────────────────────────────────────── */
   github: Object.freeze({
     repoUrl  : get    ("GITHUB_REPO_URL", ""),
     branch   : get    ("GITHUB_BRANCH",   "main"),
   }),
-
 });
 
 export default config;
