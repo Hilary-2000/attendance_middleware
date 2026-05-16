@@ -3,7 +3,7 @@ Install HIKVISION CLOUD UPDATER.
 1. Install Global Tools First
 npm install -g pm2
 npm install -g pm2-windows-startup
-npm install sharp // this is used for staff and student file compression
+npm install sharp // this is used for staff and student file compression from whatever size to 200kb or less
 
 2. Get the project from github
 :: Option A — from GitHub (recommended)
