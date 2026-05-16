@@ -3,6 +3,7 @@ Install HIKVISION CLOUD UPDATER.
 1. Install Global Tools First
 npm install -g pm2
 npm install -g pm2-windows-startup
+npm install sharp
 
 2. Get the project from github
 :: Option A — from GitHub (recommended)
