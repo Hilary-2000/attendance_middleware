@@ -20,13 +20,13 @@ module.exports = {
      * Cron format: "minute hour day month weekday"
      *   "0 * * * *"  = top of every hour  (00:00, 01:00, 02:00 …)
      *   "0 6-18 * * *" = every hour between 6AM and 6PM only
-     *   "30 * * * *" = every 30 minutes
+     *   "*\/30 * * * *" = every 30 minutes
      * ──────────────────────────────────────────────────────── */
     {
       name        : "hikvision-middleware",
       script      : "index.js",
       interpreter : "node",
-      cron_restart: "0 * * * *",    // ← runs at the top of every hour
+      cron_restart: "*/5 * * * *",    // ← (post attendance information) runs every 5 minutes
       watch       : false,
       autorestart : false,          // only run on cron schedule, not on exit
       windowsHide : true,           // ← hide terminal popups on Windows
@@ -39,14 +39,14 @@ module.exports = {
     },
 
     /* ── 2. Device person sync (runs every 2 hours) ────────────
-     * Cron: "0 2 * * *" = at minute 0 of every 2nd hour
+     * Cron: "0 *\/2 * * *" = at minute 0 of every 2nd hour
      *   00:00, 02:00, 04:00, 06:00 … 22:00  (12 times per day)
      * ──────────────────────────────────────────────────────── */
     {
       name        : "hikvision-device-sync",
       script      : "deviceSync.js",
       interpreter : "node",
-      cron_restart: "0 */2 * * *",     // every 2 hours — 12x per day
+      cron_restart: "*/10 * * * *",     // (Sync gadgets with the student and staff details)run every 10 minutes
       watch       : false,
       autorestart : false,
       windowsHide : true,
@@ -63,7 +63,7 @@ module.exports = {
       name        : "hikvision-updater",
       script      : "updater.js",
       interpreter : "node",
-      cron_restart: "30 9 * * *",
+      cron_restart: "30 9 * * *", // updates code everyday at 9:30AM
       watch       : false,
       autorestart : false,          // don't auto-restart — only run on schedule
       windowsHide : true,           // ← hide terminal popups on Windows
