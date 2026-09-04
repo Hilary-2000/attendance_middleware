@@ -9,16 +9,29 @@
  *
  *   ADD    — persons in the cloud system not yet on the device
  *   UPDATE — persons whose profile changed (name, card, etc.)
- *            + photo update ONLY when photo_update_flag = 0
+ *            + photo push, tracked per device (see below)
  *   DELETE — persons on the device no longer in the cloud system
  *
  * Biometric prefix convention:
  *   Students : 1xxxxxx
  *   Staff    : 2xxxxxx
  *
- * Flag convention:
- *   photo_update_flag = 0 → photo pending, needs to be pushed
- *   photo_update_flag = 1 → photo up to date on all devices
+ * Photo tracking (multi-terminal, unattended):
+ *   A school can have several terminals, and any one of them can be
+ *   offline on any given run. Relying solely on the cloud's
+ *   photo_update_flag breaks down here: the old logic cleared it after
+ *   the FIRST terminal succeeded, so any terminal that was offline at
+ *   that moment — or added later — would never receive that photo.
+ *
+ *   Instead this module keeps a local ledger (data/photo_sync_state.json)
+ *   of exactly which photo URL was last successfully pushed to which
+ *   terminal (keyed by the terminal's serial number, not its IP — IPs
+ *   are DHCP-assigned and change). A photo is (re)pushed to a terminal
+ *   whenever that terminal's ledger entry doesn't match the person's
+ *   current photo_url — regardless of what the cloud flag says. The
+ *   cloud's photo_update_flag is only cleared once EVERY terminal this
+ *   school has ever had confirms the current photo, so it now reflects
+ *   "synced everywhere" rather than "synced somewhere."
  *
  * Prerequisites:
  *   npm install axios form-data
@@ -36,8 +49,9 @@ import * as url    from "url";
 import sharp       from "sharp";
 import config      from "./config.js";
 
-const __dirname  = path.dirname(url.fileURLToPath(import.meta.url));
-const CACHE_FILE = path.join(__dirname, "data", "device_cache.json");
+const __dirname       = path.dirname(url.fileURLToPath(import.meta.url));
+const CACHE_FILE      = path.join(__dirname, "data", "device_cache.json");
+const PHOTO_STATE_FILE = path.join(__dirname, "data", "photo_sync_state.json");
 
 /* ── Image compression settings ─────────────────────────────── */
 // Hikvision DS-K1T342MFX-E1 face image requirements:
@@ -304,6 +318,76 @@ function saveCache(devices) {
   } catch (err) {
     console.warn(`  ⚠  Could not save device cache: ${err.message}`);
   }
+}
+
+/* ── Per-device photo-sync ledger ────────────────────────────── *
+ * Shape: {
+ *   knownSerials: [ "<serial1>", "<serial2>", … ],   // every terminal
+ *                                                     // this school has
+ *                                                     // ever had — grows,
+ *                                                     // never auto-shrinks
+ *   pushed: {
+ *     "<serial>": { "<employeeNo>": "<photo_url last pushed to it>" }
+ *   }
+ * }
+ * ──────────────────────────────────────────────────────────── */
+
+function loadPhotoState() {
+  try {
+    if (fs.existsSync(PHOTO_STATE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(PHOTO_STATE_FILE, "utf8"));
+      return {
+        knownSerials: Array.isArray(raw.knownSerials) ? raw.knownSerials : [],
+        pushed      : raw.pushed && typeof raw.pushed === "object" ? raw.pushed : {},
+      };
+    }
+  } catch { /* corrupt file — start fresh rather than crash the sync */ }
+  return { knownSerials: [], pushed: {} };
+}
+
+function savePhotoState(state) {
+  try {
+    if (!fs.existsSync(path.dirname(PHOTO_STATE_FILE))) {
+      fs.mkdirSync(path.dirname(PHOTO_STATE_FILE), { recursive: true });
+    }
+    fs.writeFileSync(PHOTO_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+  } catch (err) {
+    console.warn(`  ⚠  Could not save photo-sync state: ${err.message}`);
+  }
+}
+
+/** Add any newly-seen terminal serials to the permanent "must confirm" list. */
+function registerKnownDevices(state, devices) {
+  for (const d of devices) {
+    const serial = d.info?.serialNumber;
+    if (serial && !state.knownSerials.includes(serial)) {
+      state.knownSerials.push(serial);
+      console.log(`  + Registered new terminal for photo tracking: ${serial} (${d.ip})`);
+    }
+  }
+}
+
+/**
+ * Has THIS terminal already received the person's CURRENT photo?
+ * Defensive by design: a malformed/missing ledger must never crash a
+ * live device sync — worst case it just re-pushes a photo unnecessarily.
+ */
+function deviceHasCurrentPhoto(state, serial, empNo, photoUrl) {
+  return state?.pushed?.[serial]?.[empNo] === photoUrl;
+}
+
+function recordPhotoPushed(state, serial, empNo, photoUrl) {
+  if (!state || typeof state !== "object") return;
+  if (!state.pushed || typeof state.pushed !== "object") state.pushed = {};
+  if (!state.pushed[serial]) state.pushed[serial] = {};
+  state.pushed[serial][empNo] = photoUrl;
+}
+
+/** Has EVERY terminal this school has ever had confirmed the current photo? */
+function allKnownDevicesHavePhoto(state, empNo, photoUrl) {
+  const knownSerials = state?.knownSerials;
+  if (!Array.isArray(knownSerials) || knownSerials.length === 0) return false;
+  return knownSerials.every((serial) => state.pushed?.[serial]?.[empNo] === photoUrl);
 }
 
 /**
@@ -894,8 +978,22 @@ async function clearPhotoFlag(biometricNumber, type) {
 /**
  * Sync all persons to a single terminal.
  * ADD new → UPDATE changed → PUSH photos → DELETE removed.
+ *
+ * @param {string} serial     – this terminal's stable identity for the
+ *                              photo ledger (serial number, or its IP as
+ *                              a last-resort fallback — see runDeviceSync)
+ * @param {object} photoState – shared, mutated in place; caller persists it
  */
-async function syncDevice(client, cloudPersons) {
+async function syncDevice(client, cloudPersons, serial, photoState) {
+  // Belt-and-braces: never let a missing/malformed ledger argument abort
+  // ADD/UPDATE/DELETE for this device. Worst case with a fallback here is
+  // a redundant photo re-push next run, not a skipped sync.
+  serial = serial || client.ip;
+  if (!photoState || typeof photoState !== "object") {
+    console.warn(`     ⚠  Photo-sync state missing for ${client.ip} — photo tracking disabled for this run.`);
+    photoState = { knownSerials: [], pushed: {} };
+  }
+
   const result = {
     ip            : client.ip,
     added         : 0,
@@ -935,13 +1033,26 @@ async function syncDevice(client, cloudPersons) {
         await addPerson(client, person);
         result.added++;
         personAdded = true;
-        console.log(`     + Added  : ${empNo}  ${person.name}`);
+        console.log(
+          `     + Added  : ${empNo}  ${person.name}  ` +
+          `[${person.photo_url ? "has photo" : "NO PHOTO"}]`
+        );
       } catch (err) {
         result.errors.push(`ADD ${empNo}: ${err.message}`);
       }
 
-      // ── Upload photo only if person was added successfully ──────
-      if (personAdded && person.photo_update_flag === 0 && person.photo_url) {
+      // ── Upload photo only if person was added successfully AND
+      //    this specific terminal doesn't already have their current photo ──
+      if (personAdded && person.photo_url &&
+          !deviceHasCurrentPhoto(photoState, serial, empNo, person.photo_url)) {
+
+        if (person.photo_update_flag !== 0) {
+          console.log(
+            `       ⏭→📷 ${empNo}  ${person.name}: cloud flag says synced (flag=${person.photo_update_flag}) ` +
+            `but ${client.ip} is missing the current photo — pushing anyway`
+          );
+        }
+
         try {
           const raw = await fetchPhoto(person.photo_url);
           if (raw) {
@@ -949,8 +1060,11 @@ async function syncDevice(client, cloudPersons) {
             if (img) {
               await uploadFaceImage(client, empNo, img);
               result.photos++;
-              console.log(`       📷 Photo uploaded for ${empNo} (${Math.round(img.length / 1024)}KB)`);
-              await clearPhotoFlag(empNo, person.type).catch(() => {});
+              recordPhotoPushed(photoState, serial, empNo, person.photo_url);
+              console.log(`       📷 Photo uploaded for ${empNo}  ${person.name}  (${Math.round(img.length / 1024)}KB)`);
+              if (allKnownDevicesHavePhoto(photoState, empNo, person.photo_url)) {
+                await clearPhotoFlag(empNo, person.type).catch(() => {});
+              }
             }
           }
         } catch (err) {
@@ -979,8 +1093,18 @@ async function syncDevice(client, cloudPersons) {
         }
       }
 
-      // ── Push photo when flag = 0 (separate try) ──────────────
-      if (person.photo_update_flag === 0 && person.photo_url) {
+      // ── Push photo only if this terminal doesn't already have
+      //    the person's current photo (independent of the cloud flag) ──
+      if (person.photo_url &&
+          !deviceHasCurrentPhoto(photoState, serial, empNo, person.photo_url)) {
+
+        if (person.photo_update_flag !== 0) {
+          console.log(
+            `       ⏭→📷 ${empNo}  ${person.name}: cloud flag says synced (flag=${person.photo_update_flag}) ` +
+            `but ${client.ip} is missing the current photo — pushing anyway`
+          );
+        }
+
         try {
           const raw = await fetchPhoto(person.photo_url);
           if (raw) {
@@ -988,8 +1112,11 @@ async function syncDevice(client, cloudPersons) {
             if (img) {
               await uploadFaceImage(client, empNo, img);
               result.photos++;
-              console.log(`       📷 Photo updated for ${empNo} (${Math.round(img.length / 1024)}KB)`);
-              await clearPhotoFlag(empNo, person.type).catch(() => {});
+              recordPhotoPushed(photoState, serial, empNo, person.photo_url);
+              console.log(`       📷 Photo updated for ${empNo}  ${person.name}  (${Math.round(img.length / 1024)}KB)`);
+              if (allKnownDevicesHavePhoto(photoState, empNo, person.photo_url)) {
+                await clearPhotoFlag(empNo, person.type).catch(() => {});
+              }
             }
           }
         } catch (err) {
@@ -1062,6 +1189,12 @@ export async function runDeviceSync() {
     return;
   }
 
+  // ── 1b. Load the photo-sync ledger and register any new terminals ──
+  const photoState = loadPhotoState();
+  registerKnownDevices(photoState, devices);
+  savePhotoState(photoState);
+  console.log(`  Photo tracking: ${photoState.knownSerials.length} known terminal(s) must confirm each photo.\n`);
+
   // ── 2. Fetch authoritative person list from cloud ─────────────────
   console.log("▶ Fetching person list from Cloud School System …");
   let cloudPersons;
@@ -1085,12 +1218,24 @@ export async function runDeviceSync() {
   // ── 3. Sync each discovered device ───────────────────────────────
   const results = [];
   for (const device of devices) {
+    // Prefer the serial number (stable across DHCP changes). Fall back to
+    // IP only if a probe somehow returned a model with no serial — rare,
+    // but tracking for that device will reset if its IP later changes.
+    const serial = device.info?.serialNumber || device.ip;
+    if (!device.info?.serialNumber) {
+      console.warn(`  ⚠  ${device.ip} has no serial number — photo tracking will key off its IP instead.`);
+    }
+
     try {
-      const r = await syncDevice(device.client, cloudPersons);
+      const r = await syncDevice(device.client, cloudPersons, serial, photoState);
       results.push(r);
     } catch (err) {
       console.error(`✖  Sync failed for ${device.ip}: ${err.message}`);
       results.push({ ip: device.ip, errors: [err.message] });
+    } finally {
+      // Persist after every device so a crash mid-run doesn't lose progress
+      // and cause redundant re-pushes to devices already confirmed.
+      savePhotoState(photoState);
     }
   }
 

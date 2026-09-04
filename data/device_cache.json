@@ -1,11 +1,11 @@
 [
   {
-    "ip": "192.168.8.109",
+    "ip": "192.168.86.11",
     "info": {
       "model": "DS-K1T342MFX-E1",
-      "serialNumber": "DS-K1T342MFX-E120250912V0439180ENGL0274831",
-      "deviceName": "ROSHENACCESS1",
-      "firmwareVersion": "V4.39.180"
+      "serialNumber": "DS-K1T342MFX-E120250307V043800ENGF0765012",
+      "deviceName": "Access Controller",
+      "firmwareVersion": "V4.38.0"
     }
   }
 ]

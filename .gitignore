@@ -1,5 +1,6 @@
-".env" 
-"config.js" 
-.env 
-config.js 
-logs/ 
+".env"
+"config.js"
+.env
+config.js
+logs/
+data/photo_sync_state.json
