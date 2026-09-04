@@ -560,34 +560,191 @@ async function uploadFaceImage(client, employeeNo, imageBuffer) {
 /* ================================================================== */
 
 /**
+ * Expected response shape (any ONE of these envelopes is accepted):
+ * {
+ *   "persons": [ … ],          // or "data" / "result" / "rows" / bare array
+ *   "total"  : 842              // optional; if present it is cross-checked
+ * }
+ *
+ * Each person (field names are matched loosely — see normalisePerson):
+ *   {
+ *     "biometric_number"  : "1000001",
+ *     "name"              : "JANE DOE",
+ *     "photo_update_flag" : 0,          // 0 = needs push, 1 = up to date
+ *     "photo_url"         : "https://yourdomain.com/images/students/photo.jpg",
+ *     "type"              : "student"   // or "staff"
+ *   }
+ */
+
+/** Pull the person array out of whatever envelope the endpoint used. */
+function extractPersonList(body) {
+  if (Array.isArray(body)) return body;
+  for (const key of ["persons", "data", "result", "results", "rows", "items"]) {
+    if (Array.isArray(body?.[key])) return body[key];
+  }
+  return [];
+}
+
+/** Pull a declared total/count out of the envelope, if the endpoint sends one. */
+function extractDeclaredTotal(body) {
+  for (const key of ["total", "totalMatches", "total_count", "totalRecords", "count"]) {
+    const v = body?.[key];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && /^\d+$/.test(v.trim())) return parseInt(v, 10);
+  }
+  return null;
+}
+
+/**
+ * Normalise one raw person record into the exact shape the rest of this
+ * module expects: { biometric_number, name, photo_update_flag, photo_url, type }.
+ * Field names are matched loosely so a harmless cloud-side rename does not
+ * turn into a mass delete.
+ */
+function normalisePerson(p) {
+  const biometric_number = String(
+    p.biometric_number ?? p.biometric_no ?? p.bio_number ?? p.bio_no ??
+    p.employeeNo ?? p.employee_no ?? p.employeeNoString ?? ""
+  ).trim();
+
+  const rawFlag = p.photo_update_flag ?? p.photo_flag ?? p.photoUpdateFlag ?? 1;
+
+  return {
+    biometric_number,
+    name             : String(p.name ?? p.full_name ?? p.fullname ?? p.person_name ?? "").trim(),
+    photo_update_flag: Number(rawFlag),
+    photo_url        : p.photo_url ?? p.photo ?? p.image_url ?? p.image ?? p.picture ?? null,
+    type             : p.type ?? p.person_type ?? p.category ?? null,
+    _raw             : p,
+  };
+}
+
+function isUsableBiometric(n) {
+  return !!n && n !== "undefined" && n !== "null" && n !== "0";
+}
+
+/**
  * Fetch the full person list (students + staff) from the cloud API.
  *
- * Expected response shape:
- * {
- *   "persons": [
- *     {
- *       "biometric_number"  : "1000001",
- *       "name"              : "JANE DOE",
- *       "photo_update_flag" : 0,          // 0 = needs push, 1 = up to date
- *       "photo_url"         : "https://yourdomain.com/images/students/photo.jpg",
- *       "type"              : "student"   // or "staff"
- *     }
- *   ]
- * }
+ * Pages through the endpoint until it runs out of rows, and — if the
+ * endpoint declares a total — verifies the collected count matches it.
+ * Throws (aborting the whole sync) rather than returning a roster that
+ * looks truncated, because a short roster deletes valid enrolments.
  */
 async function fetchCloudPersons() {
   const endpoint = `${config.cloud.baseUrl}${config.cloud.personSyncEndpoint}`;
+  const { pageSize, maxPages } = config.cloud.personSync;
 
-  const res = await axios.get(endpoint, {
-    timeout     : config.cloud.timeoutMs,
-    maxRedirects: 5,
-    httpsAgent  : new https.Agent({ rejectUnauthorized: false }),
-    headers     : {
-      "X-School-Code": config.cloud.schoolCode,
-    },
-  });
+  const byId       = new Map();   // biometric_number -> normalised person
+  let   declared   = null;
+  let   prevSig    = null;
+  let   shapeShown = false;
+  let   page       = 1;
 
-  return res.data?.persons ?? [];
+  for (; page <= maxPages; page++) {
+    const res = await axios.get(endpoint, {
+      timeout     : config.cloud.timeoutMs,
+      maxRedirects: 5,
+      httpsAgent  : new https.Agent({ rejectUnauthorized: false }),
+      params      : { page, per_page: pageSize, page_size: pageSize, limit: pageSize, offset: (page - 1) * pageSize },
+      headers     : { "X-School-Code": config.cloud.schoolCode },
+    });
+
+    const body = res.data;
+
+    // A 200 that isn't a JSON object/array (HTML error page, login redirect,
+    // maintenance notice, PHP warning text …) must NOT be read as "0 persons".
+    if (body === null || (typeof body !== "object")) {
+      throw new Error(
+        `Person-sync endpoint returned a non-JSON 200 response (${typeof body}). ` +
+        `First 200 chars: ${String(body).slice(0, 200)}`
+      );
+    }
+
+    const list  = extractPersonList(body);
+    const total = extractDeclaredTotal(body);
+    if (total !== null && declared === null) declared = total;
+
+    if (!shapeShown) {
+      const envKeys = Array.isArray(body) ? "(bare array)" : `[${Object.keys(body).join(", ")}]`;
+      console.log(`  Person-sync response: envelope keys ${envKeys}, ${list.length} row(s) on page 1` +
+                  (total !== null ? `, declared total ${total}` : `, no total field`));
+      if (list[0]) console.log(`  Sample row keys: [${Object.keys(list[0]).join(", ")}]`);
+      shapeShown = true;
+    }
+
+    if (list.length === 0) break;
+
+    // Detect an endpoint that ignores paging params and returns the same
+    // list every call — otherwise the loop would run for maxPages.
+    const idOf = (x) => String(x?.biometric_number ?? x?.biometric_no ?? x?.employeeNo ?? "");
+    const sig  = `${list.length}|${idOf(list[0])}|${idOf(list[list.length - 1])}`;
+    if (sig === prevSig) {
+      console.log(`  Page ${page} identical to page ${page - 1} — endpoint is not paginating; stopping.`);
+      break;
+    }
+    prevSig = sig;
+
+    let fresh = 0;
+    for (const raw of list) {
+      const person = normalisePerson(raw);
+      if (!byId.has(person.biometric_number)) fresh++;
+      byId.set(person.biometric_number, person);
+    }
+
+    if (fresh === 0)            break;   // full page, nothing new — wrapped around
+    if (list.length < pageSize) break;   // short page — last page
+  }
+
+  if (page > maxPages) {
+    throw new Error(
+      `Person-sync exceeded CLOUD_PERSON_MAX_PAGES (${maxPages}) without finishing. ` +
+      `Aborting rather than syncing a possibly-truncated roster.`
+    );
+  }
+
+  const persons = [...byId.values()];
+
+  if (declared !== null && persons.length < declared) {
+    throw new Error(
+      `Person-sync collected ${persons.length} person(s) but the endpoint declared ` +
+      `a total of ${declared}. Roster is incomplete — aborting to avoid deleting ` +
+      `valid enrolments. (Check the endpoint's pagination / CLOUD_PERSON_PAGE_SIZE.)`
+    );
+  }
+
+  return persons;
+}
+
+/**
+ * Guard the roster before it is allowed to drive ADD/UPDATE/DELETE.
+ * Throws on anything that smells like an empty or malformed response.
+ */
+function assertRosterSane(persons) {
+  const { minRosterCount, maxInvalidRatio } = config.cloud.personSync;
+
+  if (persons.length < minRosterCount) {
+    throw new Error(
+      `Cloud roster has only ${persons.length} person(s) (minimum expected: ${minRosterCount}). ` +
+      `Refusing to sync — an empty or tiny list would delete most/all enrolments from the ` +
+      `terminal(s). Check SCHOOL_CODE, CLOUD_API_KEY and the endpoint's health.`
+    );
+  }
+
+  const invalid = persons.filter((p) => !isUsableBiometric(p.biometric_number)).length;
+  const ratio   = invalid / persons.length;
+
+  if (ratio > maxInvalidRatio) {
+    throw new Error(
+      `${invalid}/${persons.length} cloud person record(s) (${(ratio * 100).toFixed(0)}%) have no ` +
+      `usable biometric number — likely a response-shape / field-name mismatch (expected a ` +
+      `"biometric_number" field). Refusing to sync.`
+    );
+  }
+
+  if (invalid > 0) {
+    console.warn(`  ⚠  ${invalid} cloud record(s) have no biometric number — they will be ignored.`);
+  }
 }
 
 /**
@@ -740,13 +897,14 @@ async function clearPhotoFlag(biometricNumber, type) {
  */
 async function syncDevice(client, cloudPersons) {
   const result = {
-    ip     : client.ip,
-    added  : 0,
-    updated: 0,
-    deleted: 0,
-    photos : 0,
-    skipped: 0,
-    errors : [],
+    ip            : client.ip,
+    added         : 0,
+    updated       : 0,
+    deleted       : 0,
+    deletesSkipped: 0,
+    photos        : 0,
+    skipped       : 0,
+    errors        : [],
   };
 
   console.log(`\n  ── Syncing to device: ${client.ip} ──`);
@@ -842,8 +1000,25 @@ async function syncDevice(client, cloudPersons) {
   }
 
   // ── 5. DELETE — persons on device not in cloud ────────────────────
-  for (const [empNo] of devicePersons) {
-    if (!cloudNumbers.has(empNo)) {
+  const deleteCandidates = [...devicePersons.keys()].filter((e) => !cloudNumbers.has(e));
+
+  const { deleteMaxAbs, deleteMaxRatio } = config.cloud.personSync;
+  const deleteAllowed = Math.max(deleteMaxAbs, Math.ceil(deleteMaxRatio * devicePersons.size));
+
+  if (deleteCandidates.length > deleteAllowed) {
+    // Too many at once — almost always a bad cloud response, not a real
+    // exodus. Skip ALL deletes for this device and shout about it.
+    result.deletesSkipped = deleteCandidates.length;
+    const msg =
+      `DELETE ceiling hit on ${client.ip}: ${deleteCandidates.length} enrolled person(s) ` +
+      `are absent from the cloud roster, over the safety limit of ${deleteAllowed} ` +
+      `(max(${deleteMaxAbs}, ${Math.round(deleteMaxRatio * 100)}% of ${devicePersons.size})). ` +
+      `NO deletions performed. If this many people genuinely left, raise ` +
+      `CLOUD_PERSON_DELETE_MAX_ABS / CLOUD_PERSON_DELETE_MAX_RATIO, or remove them on the device manually.`;
+    result.errors.push(msg);
+    console.warn(`     ⚠  ${msg}`);
+  } else {
+    for (const empNo of deleteCandidates) {
       try {
         await deletePerson(client, empNo);
         result.deleted++;
@@ -856,8 +1031,8 @@ async function syncDevice(client, cloudPersons) {
 
   console.log(
     `     Summary → added: ${result.added}  updated: ${result.updated}  ` +
-    `deleted: ${result.deleted}  photos: ${result.photos}  ` +
-    `errors: ${result.errors.length}`
+    `deleted: ${result.deleted}  deletes-skipped: ${result.deletesSkipped}  ` +
+    `photos: ${result.photos}  errors: ${result.errors.length}`
   );
 
   return result;
@@ -892,9 +1067,13 @@ export async function runDeviceSync() {
   let cloudPersons;
   try {
     cloudPersons = await fetchCloudPersons();
-    console.log(`  Cloud returned ${cloudPersons.length} person(s).\n`);
+    assertRosterSane(cloudPersons);
+    // Drop any records with no usable biometric number so they cannot
+    // pollute the "keep" set (which would make everyone else a delete).
+    cloudPersons = cloudPersons.filter((p) => isUsableBiometric(p.biometric_number));
+    console.log(`  Cloud roster: ${cloudPersons.length} valid person(s).\n`);
   } catch (err) {
-    console.error("✖  Could not fetch cloud persons:");
+    console.error("✖  Could not fetch / validate cloud persons:");
     console.error("   Message :", err.message);
     console.error("   URL     :", `${config.cloud.baseUrl}${config.cloud.personSyncEndpoint}`);
     console.error("   Status  :", err.response?.status ?? "no response");
@@ -926,6 +1105,7 @@ export async function runDeviceSync() {
       `added:${String(r.added   ?? 0).padStart(4)}  ` +
       `updated:${String(r.updated ?? 0).padStart(4)}  ` +
       `deleted:${String(r.deleted ?? 0).padStart(4)}  ` +
+      `del-skip:${String(r.deletesSkipped ?? 0).padStart(4)}  ` +
       `photos:${String(r.photos  ?? 0).padStart(4)}  ` +
       `errors:${String(errs).padStart(3)}`
     );

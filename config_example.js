@@ -45,6 +45,14 @@ function getBool(key, defaultValue) {
   return raw.toLowerCase() === "true";
 }
 
+/** Parse to float, throw on NaN. */
+function getFloat(key, defaultValue) {
+  const raw = get(key, defaultValue);
+  const num = parseFloat(raw);
+  if (isNaN(num)) throw new Error(`[config] ${key} must be a number, got: "${raw}"`);
+  return num;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Config object                                                       */
 /* ------------------------------------------------------------------ */
@@ -77,6 +85,16 @@ const config = Object.freeze({
     batchSize           : getInt ("CLOUD_BATCH_SIZE",            50),
     retryAttempts       : getInt ("CLOUD_RETRY_ATTEMPTS",        3),
     retryDelayMs        : getInt ("CLOUD_RETRY_DELAY_MS",        2000),
+
+    /* Person-sync pagination + delete-safety guards (deviceSync.js) */
+    personSync: Object.freeze({
+      pageSize        : getInt  ("CLOUD_PERSON_PAGE_SIZE",         500),
+      maxPages        : getInt  ("CLOUD_PERSON_MAX_PAGES",         200),
+      minRosterCount  : getInt  ("CLOUD_PERSON_MIN_ROSTER",        1),
+      maxInvalidRatio : getFloat("CLOUD_PERSON_MAX_INVALID_RATIO", 0.2),
+      deleteMaxAbs    : getInt  ("CLOUD_PERSON_DELETE_MAX_ABS",    25),
+      deleteMaxRatio  : getFloat("CLOUD_PERSON_DELETE_MAX_RATIO",  0.15),
+    }),
   }),
 
   /* ── 3. Sync Scheduler ─────────────────────────────────────────── */
