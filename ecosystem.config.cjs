@@ -44,7 +44,7 @@ module.exports = {
      * ──────────────────────────────────────────────────────── */
     {
       name        : "hikvision-device-sync",
-      script      : "deviceSync.js",
+      script      : "Devicesync.js",
       interpreter : "node",
       cron_restart: "*/10 * * * *",     // (Sync gadgets with the student and staff details)run every 10 minutes
       watch       : false,

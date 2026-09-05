@@ -162,7 +162,7 @@ class DeviceClient {
     }
 
     if (probe.status !== 401) {
-      return this._parse(probe.data);
+      return this._checkAndParse(METHOD, path, probe);
     }
 
     const wwwAuth = probe.headers["www-authenticate"];
@@ -182,7 +182,23 @@ class DeviceClient {
       throw new Error(`${this.ip}: Digest Auth rejected — check credentials`);
     }
 
-    return this._parse(authed.data);
+    return this._checkAndParse(METHOD, path, authed);
+  }
+
+  /**
+   * Parse the response body and THROW on a device-level rejection
+   * (HTTP 4xx). Without this, a rejected add/update/delete/list call
+   * looks identical to a success — the caller sees no error and the
+   * request silently has no effect on the terminal.
+   */
+  _checkAndParse(method, path, res) {
+    const parsed = this._parse(res.data);
+    if (res.status >= 400) {
+      throw new Error(
+        `${this.ip}: ${method} ${path} rejected (HTTP ${res.status}): ${JSON.stringify(parsed).slice(0, 300)}`
+      );
+    }
+    return parsed;
   }
 
   _parse(data) {
@@ -506,39 +522,42 @@ async function getDevicePersons(client) {
 }
 
 /**
+ * Build the ISAPI UserInfo object shared by Add and Modify. Hikvision's
+ * UserInfo/Modify generally expects the same full object as Record — a
+ * partial payload (e.g. just employeeNo + name) is commonly rejected
+ * with an "Invalid Content" error, so both calls send everything.
+ */
+function buildUserInfo(person) {
+  return {
+    employeeNo : String(person.biometric_number),
+    name       : person.name,
+    userType   : "normal",
+    Valid      : {
+      enable   : true,
+      beginTime: "2000-01-01T00:00:00",
+      endTime  : "2037-12-31T23:59:59",
+    },
+    doorRight  : "1",
+    RightPlan  : [{ doorNo: 1, planTemplateNo: "1" }],
+  };
+}
+
+/**
  * Add a new person to the terminal.
  */
 async function addPerson(client, person) {
-  const payload = {
-    UserInfo: {
-      employeeNo : String(person.biometric_number),
-      name       : person.name,
-      userType   : "normal",
-      Valid      : {
-        enable   : true,
-        beginTime: "2000-01-01T00:00:00",
-        endTime  : "2037-12-31T23:59:59",
-      },
-      doorRight  : "1",
-      RightPlan  : [{ doorNo: 1, planTemplateNo: "1" }],
-    },
-  };
-
-  return await client.request("POST", ISAPI_PERSON_ADD, JSON.stringify(payload));
+  return await client.request(
+    "POST", ISAPI_PERSON_ADD, JSON.stringify({ UserInfo: buildUserInfo(person) })
+  );
 }
 
 /**
  * Update an existing person's details on the terminal.
  */
 async function updatePerson(client, person) {
-  const payload = {
-    UserInfo: {
-      employeeNo: String(person.biometric_number),
-      name      : person.name,
-    },
-  };
-
-  return await client.request("PUT", ISAPI_PERSON_UPDATE, JSON.stringify(payload));
+  return await client.request(
+    "PUT", ISAPI_PERSON_UPDATE, JSON.stringify({ UserInfo: buildUserInfo(person) })
+  );
 }
 
 /**
