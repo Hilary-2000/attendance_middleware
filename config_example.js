@@ -104,6 +104,15 @@ const config = Object.freeze({
     lookbackMinutes : getInt ("SYNC_LOOKBACK_MINUTES", 10),
   }),
 
+  /* ── 3b. Device Person-Sync Loop (Devicesync.js) ─────────────────
+   * Devicesync.js self-paces instead of being cron-restarted by PM2,
+   * so a slow run (e.g. photo uploads) is never killed mid-flight.
+   * intervalMinutes is the gap AFTER one run finishes before the next
+   * one starts, not a fixed clock schedule. */
+  deviceSync: Object.freeze({
+    intervalMinutes: getInt("DEVICE_SYNC_INTERVAL_MINUTES", 10),
+  }),
+
   /* ── 4. Local Queue / Offline Buffer ───────────────────────────── */
   queue: Object.freeze({
     filePath : get    ("QUEUE_FILE_PATH",  "./data/queue.json"),

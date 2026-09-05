@@ -3,7 +3,11 @@
  * ─────────────────────────────────────────────────────────────
  * Module: Person Synchronisation — Cloud System → Hikvision Terminals
  *
- * Runs every 2 hours via PM2 cron.
+ * Runs as a self-pacing loop under PM2 (see bottom of file): each pass
+ * waits config.deviceSync.intervalMinutes (default 10) after the
+ * previous pass FINISHES before starting the next one, so a slow run
+ * (e.g. photo uploads) is never killed mid-flight by a fixed-clock
+ * restart.
  * Discovers ALL Hikvision terminals on the local network, then
  * for each terminal:
  *
@@ -1200,7 +1204,7 @@ export async function runDeviceSync() {
     devices = await discoverAllDevices();
   } catch (err) {
     console.error("✖  Device discovery failed:", err.message);
-    process.exit(1);
+    throw err;
   }
 
   if (devices.length === 0) {
@@ -1231,7 +1235,7 @@ export async function runDeviceSync() {
     console.error("   Status  :", err.response?.status ?? "no response");
     console.error("   Detail  :", err.response?.data   ?? "no response body");
     console.error("   Code    :", err.code              ?? "no error code");
-    process.exit(1);
+    throw err;
   }
 
   // ── 3. Sync each discovered device ───────────────────────────────
@@ -1279,13 +1283,37 @@ export async function runDeviceSync() {
 }
 
 /* ================================================================== */
-/*  Standalone entry point                                              */
+/*  Standalone entry point — self-pacing loop                          */
 /* ================================================================== */
+/*
+ * PM2 no longer cron-restarts this process. A device sync can run
+ * long (photo uploads to a slow terminal), and a fixed-clock restart
+ * would kill it mid-flight and start over — potentially never
+ * finishing a full pass. Instead this process stays alive under PM2
+ * (autorestart: true) and paces itself: run a full sync, then wait
+ * `deviceSync.intervalMinutes` measured from when that run finished
+ * before starting the next one. That gap makes overlap structurally
+ * impossible regardless of how long any single run takes.
+ */
 
-runDeviceSync().catch((err) => {
-  console.error("✖  Unhandled error:", err.message);
-  process.exit(1);
-});
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function loop() {
+  const intervalMs = config.deviceSync.intervalMinutes * 60_000;
+
+  for (;;) {
+    try {
+      await runDeviceSync();
+    } catch (err) {
+      console.error("✖  Unhandled error:", err.message);
+    }
+
+    console.log(`  Next device sync in ${config.deviceSync.intervalMinutes} minute(s).\n`);
+    await sleep(intervalMs);
+  }
+}
+
+loop();
 
 /* ================================================================== */
 /*  Types                                                               */

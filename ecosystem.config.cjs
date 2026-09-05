@@ -38,17 +38,22 @@ module.exports = {
       log_date_format: "YYYY-MM-DD HH:mm:ss",
     },
 
-    /* ── 2. Device person sync (runs every 2 hours) ────────────
-     * Cron: "0 *\/2 * * *" = at minute 0 of every 2nd hour
-     *   00:00, 02:00, 04:00, 06:00 … 22:00  (12 times per day)
+    /* ── 2. Device person sync (self-pacing loop) ────────────
+     * Long-lived process, NOT cron-restarted: a device sync can run
+     * past 10 minutes (photo uploads to a slow terminal), and a
+     * fixed-clock cron restart would kill it mid-flight instead of
+     * letting it finish. Devicesync.js loops internally — it runs a
+     * full sync, then waits DEVICE_SYNC_INTERVAL_MINUTES (default 10,
+     * see config.js) measured from when that run finished before
+     * starting the next one. autorestart brings it back if it ever
+     * crashes outright.
      * ──────────────────────────────────────────────────────── */
     {
       name        : "hikvision-device-sync",
       script      : "Devicesync.js",
       interpreter : "node",
-      cron_restart: "*/10 * * * *",     // (Sync gadgets with the student and staff details)run every 10 minutes
       watch       : false,
-      autorestart : false,
+      autorestart : true,
       windowsHide : true,
       env: {
         NODE_ENV: "production",
