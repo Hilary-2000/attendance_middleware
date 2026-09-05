@@ -507,7 +507,12 @@ async function getDevicePersons(client) {
     payload.UserInfoSearchCond.searchResultPosition = offset;
 
     const data = await client.request("POST", ISAPI_PERSON_LIST, JSON.stringify(payload));
-    const list = data?.UserInfoSearch?.InfoList ?? [];
+    // UserInfo/Search nests results under "UserInfo", not "InfoList" (that
+    // field name belongs to the AcsEvent search response). Getting this
+    // wrong makes every page look empty while totalMatches still reports
+    // the real count — every person then looks "missing" and gets a
+    // redundant ADD, which the device correctly rejects as already existing.
+    const list = data?.UserInfoSearch?.UserInfo ?? [];
 
     if (total === null) {
       total = data?.UserInfoSearch?.totalMatches ?? list.length;
