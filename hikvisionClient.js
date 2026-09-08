@@ -122,14 +122,17 @@ export class HikvisionClient {
    * Step 1 – Send without credentials  →  device returns 401 + WWW-Authenticate
    * Step 2 – Compute digest, resend    →  device returns 200 + data
    *
-   * @param {string}  method   – "GET" | "POST"
-   * @param {string}  path     – ISAPI path
-   * @param {object}  [body]   – JSON body for POST
-   * @param {object}  [params] – URL query-string params
-   * @returns {Promise<any>}   – parsed JSON response body
+   * @param {string}         method   – "GET" | "POST" | "PUT"
+   * @param {string}         path     – ISAPI path
+   * @param {object|string}  [body]   – JSON body, or a raw XML string
+   *                                    (sent as application/xml)
+   * @param {object}         [params] – URL query-string params
+   * @returns {Promise<any>}   – parsed JSON response body (or raw XML string)
    */
   async request(method, path, body = null, params = {}) {
-    const METHOD = method.toUpperCase();
+    const METHOD      = method.toUpperCase();
+    const isXml       = typeof body === "string";
+    const contentType = isXml ? "application/xml" : "application/json";
 
     // ── Step 1: unauthenticated probe ──────────────────────────────
     let probe;
@@ -139,7 +142,7 @@ export class HikvisionClient {
         url    : path,
         params,
         data   : body ?? undefined,
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": contentType },
       });
     } catch (err) {
       // Network-level error (ECONNREFUSED, ETIMEDOUT, etc.)
@@ -177,7 +180,7 @@ export class HikvisionClient {
         params,
         data   : body ?? undefined,
         headers: {
-          "Content-Type" : "application/json",
+          "Content-Type" : contentType,
           "Authorization": authHeader,
         },
       });
@@ -215,6 +218,85 @@ export class HikvisionClient {
   async getDeviceInfo() {
     const data = await this.request("GET", "/ISAPI/System/deviceInfo");
     return data?.DeviceInfo ?? data;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /*  Public: Device clock                                              */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Read the terminal's clock (ISAPI GET /System/time).
+   * Handles both the XML and JSON response shapes.
+   *
+   * @returns {Promise<{ timeMode: string, localTime: string, timeZone: string }>}
+   */
+  async getTime() {
+    const data = await this.request("GET", "/ISAPI/System/time");
+
+    if (typeof data === "string") {
+      const pick = (tag) => data.match(new RegExp(`<${tag}>([^<]+)</${tag}>`))?.[1] ?? null;
+      return {
+        timeMode : pick("timeMode"),
+        localTime: pick("localTime"),
+        timeZone : pick("timeZone"),
+      };
+    }
+
+    const T = data?.Time ?? data ?? {};
+    return { timeMode: T.timeMode ?? null, localTime: T.localTime ?? null, timeZone: T.timeZone ?? null };
+  }
+
+  /**
+   * Force the terminal's clock to `when` (default: now) in the given
+   * IANA zone, using manual time mode. Event timestamps on this device
+   * are only as trustworthy as this clock, so we assert it every run.
+   *
+   * @param {object}  [opts]
+   * @param {Date}    [opts.when]              – target instant (default now)
+   * @param {string}  [opts.ianaZone]          – e.g. "Africa/Nairobi" (for the wall-clock value)
+   * @param {number}  [opts.maxDriftSeconds=90]– skip the write if drift is under this
+   * @returns {Promise<{ changed: boolean, driftSeconds: number, deviceLocal: string, setTo?: string }>}
+   */
+  async syncClock({ when = new Date(), ianaZone = "Africa/Nairobi", maxDriftSeconds = 90 } = {}) {
+    const current = await this.getTime();
+
+    // Drift = |now − device localTime| in seconds (device string carries its own offset)
+    const deviceMs   = Date.parse(current.localTime);
+    const driftSec   = Number.isNaN(deviceMs)
+      ? Infinity
+      : Math.abs(when.getTime() - deviceMs) / 1000;
+
+    if (driftSec <= maxDriftSeconds) {
+      return { changed: false, driftSeconds: Math.round(driftSec), deviceLocal: current.localTime };
+    }
+
+    // Wall-clock value for the configured zone: "YYYY-MM-DDTHH:MM:SS"
+    const wall = new Intl.DateTimeFormat("sv-SE", {
+      timeZone: ianaZone,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }).format(when).replace(" ", "T");
+
+    // Keep the device's existing POSIX zone string if it already has one,
+    // otherwise fall back to UTC+3 ("CST-3:00:00" in Hikvision's notation).
+    const tz = current.timeZone || "CST-3:00:00";
+
+    const xml =
+`<?xml version="1.0" encoding="UTF-8"?>
+<Time version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+<timeMode>manual</timeMode>
+<localTime>${wall}</localTime>
+<timeZone>${tz}</timeZone>
+</Time>`;
+
+    await this.request("PUT", "/ISAPI/System/time", xml);
+
+    return {
+      changed: true,
+      driftSeconds: Number.isFinite(driftSec) ? Math.round(driftSec) : null,
+      deviceLocal: current.localTime,
+      setTo: wall,
+    };
   }
 
   /* ---------------------------------------------------------------- */

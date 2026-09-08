@@ -27,18 +27,44 @@ import config                               from "./config.js";
 /* ================================================================== */
 
 /**
- * Returns ISO-8601 date strings for the full current day (local time)
- * plus the "YYYY-MM-DD" string used as the sync payload date.
+ * Returns ISO-8601 date strings for the full current day plus the
+ * "YYYY-MM-DD" string used as the sync payload date.
  *
+ * "Today" is resolved in the configured site timezone
+ * (config.sync.timezone / SYNC_TIMEZONE), NOT the host clock's own
+ * timezone — so the device query window and the cloud attendance date
+ * stay correct even if the server's OS timezone is wrong or drifts.
+ * If the configured zone is invalid, falls back to host-local time.
+ *
+ * @param {string} [timeZone] – IANA zone name, e.g. "Africa/Nairobi"
  * @returns {{ startTime: string, endTime: string, dateStr: string }}
  */
-function getTodayRange() {
-  const now = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
+function getTodayRange(timeZone = config.sync.timezone) {
+  let yyyy, mm, dd;
 
-  const yyyy = now.getFullYear();
-  const mm   = pad(now.getMonth() + 1);
-  const dd   = pad(now.getDate());
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year : "numeric",
+      month: "2-digit",
+      day  : "2-digit",
+    }).formatToParts(new Date());
+
+    const part = (type) => parts.find((p) => p.type === type)?.value;
+    yyyy = part("year");
+    mm   = part("month");
+    dd   = part("day");
+  } catch {
+    console.warn(`  ⚠  Invalid SYNC_TIMEZONE "${timeZone}" — using host local time instead.`);
+  }
+
+  if (!yyyy || !mm || !dd) {
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    yyyy = now.getFullYear();
+    mm   = pad(now.getMonth() + 1);
+    dd   = pad(now.getDate());
+  }
 
   return {
     startTime: `${yyyy}-${mm}-${dd}T00:00:00`,
@@ -114,10 +140,29 @@ async function main() {
     process.exit(1);
   }
 
-  // ── 3. Pull today's raw events ───────────────────────────────────
+  // ── 3. Assert the terminal clock ────────────────────────────────
+  // Every attendance timestamp comes from the device clock. This model
+  // runs in manual time mode with no NTP, so it drifts; if it drifts
+  // past a day boundary the daily query silently returns nothing.
+  // Push the middleware host's (correct) time before we trust the logs.
+  try {
+    const clock = await terminal.syncClock({ ianaZone: config.sync.timezone });
+    if (clock.changed) {
+      console.log(
+        `▶ Terminal clock corrected: was ${clock.deviceLocal} ` +
+        `(${clock.driftSeconds}s off) → set to ${clock.setTo} ${config.sync.timezone}\n`
+      );
+    } else {
+      console.log(`▶ Terminal clock OK (${clock.driftSeconds}s drift): ${clock.deviceLocal}\n`);
+    }
+  } catch (err) {
+    console.warn(`⚠  Could not verify/set terminal clock: ${err.message}\n`);
+  }
+
+  // ── 4. Pull today's raw events ───────────────────────────────────
   const { startTime, endTime, dateStr } = getTodayRange();
   console.log("▶ Fetching attendance events …");
-  console.log(`  Date  : ${dateStr}`);
+  console.log(`  Date  : ${dateStr}  (${config.sync.timezone})`);
   console.log(`  Range : ${startTime}  →  ${endTime}\n`);
 
   let rawRecords;
@@ -140,7 +185,7 @@ async function main() {
 
   console.log(`  Pulled ${rawRecords.length} raw event(s) from terminal.\n`);
 
-  // ── 4. Split records by biometric prefix ────────────────────────
+  // ── 5. Split records by biometric prefix ────────────────────────
   //   Prefix "1" → students  → attendanceProcessor.js
   //   Prefix "2" → staff     → staffAttendanceProcessor.js
   //   Anything else           → ignored
@@ -153,7 +198,7 @@ async function main() {
 
   console.log(`  ${studentRaw.length} student event(s)  |  ${staffRaw.length} staff event(s)\n`);
 
-  // ── 5. Process students ───────────────────────────────────────────
+  // ── 6. Process students ───────────────────────────────────────────
   console.log("▶ Processing student attendance …");
   const processedStudents = processAttendance(studentRaw);
 
@@ -164,7 +209,7 @@ async function main() {
     console.log("  No valid student records after processing.\n");
   }
 
-  // ── 6. Process staff ──────────────────────────────────────────────
+  // ── 7. Process staff ──────────────────────────────────────────────
   console.log("▶ Processing staff attendance …");
   const processedStaff = processStaffAttendance(staffRaw);
 
@@ -177,7 +222,7 @@ async function main() {
     console.log("  No valid staff records after processing.\n");
   }
 
-  // ── 7. Sync students to cloud ─────────────────────────────────────
+  // ── 8. Sync students to cloud ─────────────────────────────────────
   if (processedStudents.length > 0) {
     const { success, sent, response } = await syncToCloud(processedStudents, dateStr);
     if (success) {
@@ -188,7 +233,7 @@ async function main() {
     }
   }
 
-  // ── 8. Sync staff to cloud ────────────────────────────────────────
+  // ── 9. Sync staff to cloud ────────────────────────────────────────
   if (processedStaff.length > 0) {
     const { success, sent, response } = await syncStaffToCloud(processedStaff, dateStr);
     if (success) {
