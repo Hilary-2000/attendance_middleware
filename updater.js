@@ -283,8 +283,8 @@ async function main() {
   info(`Files: ${changed.length} updated`);
   if (pkgChanged) info("Deps : reinstalled");
   log("");
-  ok("Restart the middleware to apply changes:");
-  info("  node index.js");
+  ok("Code applied. Long-running processes must be restarted to pick it up.");
+  info("  (the HikvisionUpdater task bounces HikvisionDeviceSync automatically)");
   log("");
 }
 

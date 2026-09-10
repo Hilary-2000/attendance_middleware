@@ -1,82 +1,139 @@
-Install HIKVISION CLOUD UPDATER.
+Install HIKVISION CLOUD UPDATER  (native Windows Task Scheduler - no PM2)
 
-1. Install Global Tools First
-npm install -g pm2
-npm install -g pm2-windows-startup
-npm install sharp // this is used for staff and student file compression from whatever size to 200kb or less
+The middleware runs as three Windows Scheduled Tasks under the SYSTEM account,
+so it starts automatically at boot with NO login required and restarts itself
+if it crashes.
 
-2. Get the project from github
-:: Option A — from GitHub (recommended)
-git clone https://github.com/yourusername/hikvision-middleware.git
-cd hikvision-middleware
+===========================================================================
+ ONE-LINE INSTALL  (fresh PC)
+===========================================================================
 
-:: Option B — from zip
-:: just extract the zip and cd into the folder
+1. Open Windows PowerShell / Terminal AS ADMINISTRATOR
+   (Start menu -> type "PowerShell" -> right-click -> Run as administrator;
+    the title bar must say "Administrator").
 
-3. Install Dependencies
-npm install
+2. Paste this single line and press Enter:
 
-4. Create Fresh Config files
-:: Copy the example and fill in real values
-copy .env.example .env
-:: Then open .env in Notepad and update:
-::   TERMINAL_HOST, TERMINAL_PASSWORD, SCHOOL_CODE etc.
-notepad .env
+   [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/Hilary-2000/attendance_middleware/main/setup/bootstrap.ps1 | iex
 
-5. Start PM2
-pm2 start ecosystem.config.cjs
-pm2 save
+3. Answer the prompts:
+   - install location   (press Enter for  C:\attendance_middleware )
+   - Notepad opens on .env  -> fill in TERMINAL_HOST, TERMINAL_PASSWORD,
+     SCHOOL_CODE, CLOUD_API_BASE_URL, SYNC_TIMEZONE (Africa/Nairobi),
+     then SAVE and CLOSE Notepad to continue.
 
-6. Register PM2 to start on boot.
-pm2-startup install
-pm2 save
+4. Reboot the PC. Wait ~2 minutes, then in a normal PowerShell:
 
-:: IMPORTANT — pm2-startup / pm2-windows-startup only resurrects PM2 when
-:: someone actually LOGS IN to this Windows account (it works by adding an
-:: entry under HKCU\...\Run, which only fires at logon). If the machine
-:: reboots and nobody logs in (Windows update, power cut, unattended
-:: restart), PM2 stays dead and attendance stops silently until a human
-:: notices and logs in. This bit us on 2026-09-08/09 — a ~16.5 hour gap
-:: where no attendance synced to the cloud. Do step 6b below as well to
-:: close that gap.
+   cd C:\attendance_middleware
+   .\setup\manage.ps1 status
 
-6b. Register a TRUE boot-time recovery task (no login required)
-:: This runs pm2-resurrect.bat as SYSTEM, 60 seconds after Windows boots,
-:: regardless of whether anyone logs in. It restores whatever process
-:: list was last saved with `pm2 save` (step 5), same as pm2-startup does,
-:: it just doesn't need a human to log in first.
-::
-:: pm2-resurrect.bat and register-boot-task.ps1 are both in this project
-:: folder already. Edit the paths inside them if you're deploying to a
-:: different machine/username, then:
-::
-::   1. Open PowerShell as Administrator (right-click PowerShell ->
-::      "Run as administrator", approve the UAC prompt — the window
-::      title must read "Administrator: Windows PowerShell").
-::   2. Run:
-powershell -ExecutionPolicy Bypass -File "register-boot-task.ps1"
-::
-:: This registers a Scheduled Task named
-:: "PM2 Resurrect - Hikvision Attendance (Boot)" that fires at every
-:: system startup as SYSTEM. Verify with:
-Get-ScheduledTask -TaskName "PM2 Resurrect*"
-::
-:: To test it without actually rebooting (must also be run elevated):
-::   pm2 kill
-::   Start-ScheduledTask -TaskName "PM2 Resurrect - Hikvision Attendance (Boot)"
-::   pm2 status   (should show processes restored within ~5 seconds)
+   Expect HikvisionDeviceSync with a running "node" process and
+   HikvisionMiddleware with a recent run and LastResult 0x0.
 
-7. Verify everything is running
-pm2 status
-pm2 logs
+That's it. Nothing else is ever needed.
 
-8. Restart PM2
-pm2 delete all
-pm2 start ecosystem.config.cjs
-pm2 save
+What the one-liner does:
+  - installs Node.js LTS + Git (via winget) if they are missing
+  - clones this repo (or pulls, if it is already there)
+  - runs "npm install"
+  - creates .env and config.js from the *_example files, opens .env for editing
+  - runs setup\install-native.ps1, which registers 3 SYSTEM scheduled tasks:
 
-9. Whenever you edit ecosystem.config.cjs (add/remove/rename a PM2 app)
-:: Both the logon-trigger (pm2-startup) and boot-trigger (step 6b) recovery
-:: mechanisms replay whatever was last saved — not your latest edits —
-:: until you re-save:
-pm2 save
+      HikvisionDeviceSync  person + face-photo sync loop (Devicesync.js)
+                           starts 30s after boot; 10-min watchdog;
+                           auto-restart on crash
+      HikvisionMiddleware  posts attendance to the cloud (index.js)
+                           every 5 minutes
+      HikvisionUpdater     git pull new code daily 09:30, then restart
+                           device-sync (updater.js)
+
+===========================================================================
+ MANUAL INSTALL  (if the one-liner cannot be used)
+===========================================================================
+
+1. Install Node.js LTS and Git for Windows. Confirm they are on PATH:
+     node -v
+     git --version
+
+2. Get the project:
+     git clone https://github.com/Hilary-2000/attendance_middleware.git
+     cd attendance_middleware
+
+3. Install dependencies:
+     npm install
+
+4. Create the config files (both are git-ignored):
+     copy .env_example .env
+     copy config_example.js config.js
+     notepad .env        :: set the real terminal / school / cloud values
+
+5. Register the tasks - ELEVATED PowerShell:
+     cd <folder>
+     .\setup\install-native.ps1
+   (answer "y" to "Uninstall PM2 now?" if this box previously ran PM2)
+
+6. Reboot, then verify:
+     .\setup\manage.ps1 status
+
+===========================================================================
+ DAY-TO-DAY MANAGEMENT
+===========================================================================
+
+   .\setup\manage.ps1 status                 :: overview + recent log lines
+   .\setup\manage.ps1 logs device-sync       :: live log (Ctrl+C to quit)
+   .\setup\manage.ps1 logs middleware
+   .\setup\manage.ps1 logs updater
+   .\setup\manage.ps1 restart                :: restart all   (needs admin)
+   .\setup\manage.ps1 restart device-sync    :: restart one   (needs admin)
+   .\setup\manage.ps1 stop                   :: stop + disable (needs admin)
+   .\setup\manage.ps1 start                  :: enable + start (needs admin)
+
+   Raw logs are in  logs\  :
+     device-sync-out.log / device-sync-err.log
+     middleware-out.log  / middleware-err.log
+     updater-out.log     / updater-err.log
+   (each rotates to *.log.1 once it passes ~5 MB)
+
+===========================================================================
+ UPDATING THE CODE
+===========================================================================
+
+   Automatic: HikvisionUpdater runs "git pull" every day at 09:30 and then
+   restarts device-sync. The middleware picks up new code on its next
+   5-minute run by itself.
+
+   Manual:
+     git pull
+     .\setup\manage.ps1 restart               (elevated)
+
+   You do NOT need to re-run install-native.ps1 after a code update. Re-run
+   it only if you move the project folder or change the task definitions.
+   It is safe to run again any time.
+
+===========================================================================
+ TROUBLESHOOTING
+===========================================================================
+
+   - A task's LastResult is not 0x0  -> open the matching logs\*-err.log.
+     The task retries on its next tick.
+   - device-sync not running         -> .\setup\manage.ps1 restart device-sync
+                                        (elevated), then check its err log.
+   - "winget not found" in step 2     -> install Node.js LTS + Git by hand,
+                                        then use the MANUAL INSTALL section.
+   - Test boot recovery without rebooting (elevated):
+       .\setup\manage.ps1 stop
+       Start-ScheduledTask -TaskName HikvisionDeviceSync
+       Start-ScheduledTask -TaskName HikvisionMiddleware
+       .\setup\manage.ps1 status
+
+===========================================================================
+ ROLL BACK TO PM2  (not recommended)
+===========================================================================
+
+   .\setup\uninstall-native.ps1        (elevated)
+   npm install -g pm2
+   pm2 start ecosystem.config.cjs
+   pm2 save
+
+   ecosystem.config.cjs, pm2-resurrect.bat and register-boot-task.ps1 are
+   kept in the repo only for this rollback path.
