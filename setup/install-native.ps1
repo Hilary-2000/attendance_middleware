@@ -67,8 +67,8 @@ git config --system --replace-all safe.directory $repoForGit 2>$null
 git config --system --add     safe.directory '*'            2>$null
 Write-Host "git safe.directory configured for SYSTEM"
 
-# --- stop / remove the old PM2 setup ----------------------------------------
-Write-Host "`nStopping the old PM2 setup ..." -ForegroundColor Cyan
+# --- stop anything already running -----------------------------------------
+Write-Host "`nStopping the old PM2 setup / any previous run ..." -ForegroundColor Cyan
 
 foreach ($t in 'PM2 Resurrect - Hikvision Attendance',
                'PM2 Resurrect - Hikvision Attendance (Boot)') {
@@ -78,12 +78,19 @@ foreach ($t in 'PM2 Resurrect - Hikvision Attendance',
     }
 }
 
-try { & pm2 kill 2>$null | Out-Null } catch { }
+# End any existing native task instances so their cmd.exe/node trees die too
+foreach ($t in 'HikvisionDeviceSync','HikvisionMiddleware','HikvisionUpdater') {
+    schtasks /End /TN $t 2>$null | Out-Null
+}
 
-Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-    Where-Object { $_.CommandLine -match 'pm2|Daemon\.js|ProcessContainerFork|InteractorDaemon|index\.js|Devicesync\.js|updater\.js' } |
+cmd /c "pm2 kill" 2>&1 | Out-Null
+
+# Kill leftover node AND the cmd.exe wrappers that host our scripts, so a
+# half-running instance can't linger (e.g. run.cmd edited mid-execution).
+Get-CimInstance Win32_Process -Filter "Name = 'node.exe' OR Name = 'cmd.exe'" |
+    Where-Object { $_.CommandLine -match 'pm2|Daemon\.js|ProcessContainerFork|InteractorDaemon|attendance_middleware|run\.cmd|run-updater\.cmd|index\.js|Devicesync\.js|updater\.js' } |
     ForEach-Object {
-        Write-Host "  killing stale node PID $($_.ProcessId)"
+        Write-Host "  killing stale $($_.Name) PID $($_.ProcessId)"
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
 Start-Sleep 2
@@ -179,18 +186,18 @@ $doRemove =
     }
 
 if ($doRemove) {
-    try {
-        & pm2 kill 2>$null | Out-Null
-        npm uninstall -g pm2
-        Remove-Item "$env:USERPROFILE\.pm2" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item 'C:\ProgramData\pm2'   -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "PM2 removed." -ForegroundColor Green
-        Write-Host "Note: pm2-resurrect.bat, register-boot-task.ps1 and ecosystem.config.cjs"
-        Write-Host "are still tracked in git - delete them in a commit when you're ready."
-    } catch {
-        Write-Host "PM2 uninstall hit an error: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host "Run 'npm uninstall -g pm2' by hand later."
+    Write-Host "Removing PM2 ..."
+    cmd /c "pm2 kill"            2>&1 | Out-Null   # harmless "No process found" is fine
+    cmd /c "npm uninstall -g pm2" 2>&1 | Out-Null
+    Remove-Item "$env:USERPROFILE\.pm2" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item 'C:\ProgramData\pm2'    -Recurse -Force -ErrorAction SilentlyContinue
+    if (Get-Command pm2 -ErrorAction SilentlyContinue) {
+        Write-Host "  PM2 could not be fully removed - run 'npm uninstall -g pm2' by hand." -ForegroundColor Yellow
+    } else {
+        Write-Host "  PM2 removed." -ForegroundColor Green
     }
+    Write-Host "  (pm2-resurrect.bat, register-boot-task.ps1, ecosystem.config.cjs stay in"
+    Write-Host "   git for rollback - delete them in a commit when ready.)"
 } elseif ($pm2Present) {
     Write-Host "Left PM2 installed (unused). Remove later with: npm uninstall -g pm2"
 }
