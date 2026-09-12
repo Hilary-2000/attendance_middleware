@@ -83,6 +83,11 @@ const ISAPI_PERSON_DELETE = "/ISAPI/AccessControl/UserInfo/Delete?format=json";
 // DS-K1T342MFX-E1 is a face recognition terminal
 // Uses Intelligent/FDLib path, NOT AccessControl/FaceDataRecord
 const ISAPI_FACE_UPLOAD = "/ISAPI/Intelligent/FDLib/FaceDataRecord?format=json";
+// PUT on the above is rejected (methodNotAllowed) — replacing a face means
+// delete then re-add. Two delete conventions exist across Hikvision
+// firmwares; try the same-path query-string form first, then fall back to
+// the FDSearch/Delete body form. See deleteFaceRecord().
+const ISAPI_FACE_DELETE_SEARCH = "/ISAPI/Intelligent/FDLib/FDSearch/Delete?format=json";
 
 /* ================================================================== */
 /*  Digest-Auth (self-contained — no external dependency)              */
@@ -358,11 +363,12 @@ function loadPhotoState() {
       const raw = JSON.parse(fs.readFileSync(PHOTO_STATE_FILE, "utf8"));
       return {
         knownSerials: Array.isArray(raw.knownSerials) ? raw.knownSerials : [],
-        pushed      : raw.pushed && typeof raw.pushed === "object" ? raw.pushed : {},
+        pushed      : raw.pushed   && typeof raw.pushed   === "object" ? raw.pushed   : {},
+        failures    : raw.failures && typeof raw.failures === "object" ? raw.failures : {},
       };
     }
   } catch { /* corrupt file — start fresh rather than crash the sync */ }
-  return { knownSerials: [], pushed: {} };
+  return { knownSerials: [], pushed: {}, failures: {} };
 }
 
 function savePhotoState(state) {
@@ -401,6 +407,24 @@ function recordPhotoPushed(state, serial, empNo, photoUrl) {
   if (!state.pushed || typeof state.pushed !== "object") state.pushed = {};
   if (!state.pushed[serial]) state.pushed[serial] = {};
   state.pushed[serial][empNo] = photoUrl;
+}
+
+/**
+ * Record that every automated variant we tried was still rejected by the
+ * device, so it shows up in the ledger for manual follow-up instead of
+ * silently retrying forever on every sync run.
+ */
+function recordPhotoFailure(state, empNo, info) {
+  if (!state || typeof state !== "object") return;
+  if (!state.failures || typeof state.failures !== "object") state.failures = {};
+  state.failures[empNo] = { ...info, lastTried: new Date().toISOString() };
+}
+
+/** Clear any previously-recorded failure once a photo goes through. */
+function clearPhotoFailure(state, empNo) {
+  if (state?.failures && typeof state.failures === "object") {
+    delete state.failures[empNo];
+  }
 }
 
 /** Has EVERY terminal this school has ever had confirmed the current photo? */
@@ -583,8 +607,54 @@ async function deletePerson(client, employeeNo) {
 }
 
 /**
+ * Build an Error for a device-rejected face upload, with the parsed
+ * Hikvision response fields attached so callers can tell a content/quality
+ * rejection (worth retrying with a re-processed image) apart from anything
+ * else (auth, malformed request, device fault — retrying won't help).
+ */
+function buildFaceUploadError(httpStatus, result) {
+  const err = new Error(`Face upload rejected (HTTP ${httpStatus}): ${JSON.stringify(result)}`);
+  err.httpStatus     = httpStatus;
+  err.hikStatusCode  = result?.statusCode;
+  err.hikSubStatus   = result?.subStatusCode;
+  err.hikErrorCode   = result?.errorCode;
+  return err;
+}
+
+/**
+ * True when the device already has a face on file for this FPID and
+ * refused a POST (add) — not a photo-quality problem. Fixed by retrying
+ * the same image with PUT (modify/replace) instead, never by reprocessing
+ * the image.
+ */
+function isFaceAlreadyExists(err) {
+  return err?.httpStatus === 400 && err.hikSubStatus === "deviceUserAlreadyExistFace";
+}
+
+/**
+ * True when the device rejected the upload because it couldn't process the
+ * *content* of the image (bad framing, no detectable face, poor modeling
+ * quality, etc.) rather than an auth/protocol/network problem or an
+ * already-exists conflict. Only these are worth retrying with a
+ * re-processed variant of the same photo.
+ */
+function isFaceContentRejection(err) {
+  if (!err || err.httpStatus !== 400) return false;
+  if (isFaceAlreadyExists(err)) return false; // handled separately — not an image problem
+  // Hikvision statusCode 6 = "Invalid Content" — covers modeling/analysis
+  // failures generically; subStatusCode narrows it further when present.
+  if (err.hikStatusCode === 6) return true;
+  return /modeling|analysis|subpic/i.test(err.hikSubStatus || "");
+}
+
+/**
  * Upload a face image for a person on the terminal.
  * Image must be a JPEG Buffer.
+ *
+ * Note: this device firmware only allows POST here — PUT is rejected with
+ * methodNotAllowed ("Method and protocol do not match"), so replacing an
+ * existing face means delete-then-add, not modify-in-place. See
+ * deleteFaceRecord() / tryFaceUpload().
  */
 async function uploadFaceImage(client, employeeNo, imageBuffer) {
   // DS-K1T342MFX-E1 correct face upload endpoint
@@ -632,7 +702,7 @@ async function uploadFaceImage(client, employeeNo, imageBuffer) {
   if (probe.status !== 401) {
     const result = client._parse(probe.data);
     if (probe.status >= 400) {
-      throw new Error(`Face upload rejected (HTTP ${probe.status}): ${JSON.stringify(result)}`);
+      throw buildFaceUploadError(probe.status, result);
     }
     return result;
   }
@@ -660,7 +730,7 @@ async function uploadFaceImage(client, employeeNo, imageBuffer) {
   const result = client._parse(authed.data);
 
   if (authed.status >= 400) {
-    throw new Error(`Face upload rejected (HTTP ${authed.status}): ${JSON.stringify(result)}`);
+    throw buildFaceUploadError(authed.status, result);
   }
 
   return result;
@@ -912,6 +982,7 @@ async function compressImage(imageBuffer, label = "") {
     // but skip heavy compression
     if (imageBuffer.length <= MAX_IMAGE_BYTES) {
       const converted = await sharp(imageBuffer)
+        .rotate() // auto-orient from EXIF before resizing (phone/webcam photos)
         .resize(TARGET_WIDTH, TARGET_HEIGHT, {
           fit           : "inside",   // maintain aspect ratio
           withoutEnlargement: true,   // never upscale
@@ -934,6 +1005,7 @@ async function compressImage(imageBuffer, label = "") {
     // ── Phase 1: reduce quality at target resolution ─────────────
     while (quality >= MIN_QUALITY) {
       result = await sharp(imageBuffer)
+        .rotate() // auto-orient from EXIF before resizing (phone/webcam photos)
         .resize(width, height, { fit: "inside", withoutEnlargement: true })
         .jpeg({ quality })
         .toBuffer();
@@ -959,6 +1031,7 @@ async function compressImage(imageBuffer, label = "") {
 
     for (const [w, h] of resizeSteps) {
       result = await sharp(imageBuffer)
+        .rotate() // auto-orient from EXIF before resizing (phone/webcam photos)
         .resize(w, h, { fit: "inside", withoutEnlargement: true })
         .jpeg({ quality: MIN_QUALITY })
         .toBuffer();
@@ -981,6 +1054,161 @@ async function compressImage(imageBuffer, label = "") {
   } catch (err) {
     console.warn(`       ⚠  Image compression failed for ${label}: ${err.message}`);
     return null;
+  }
+}
+
+/**
+ * Re-processed variants of a raw photo, tried in order only when the device
+ * has rejected the default compressed image for a content/modeling reason.
+ * Each returns a near-lossless JPEG Buffer that still needs to go through
+ * compressImage() to land under the 200KB limit before upload.
+ *
+ *   "enhance"      – auto-levels contrast/brightness and sharpens; helps
+ *                    photos that are flat, dim, or slightly soft.
+ *   "crop-tight"   – crops 18% off each side (centered) to raise the
+ *                    face-to-frame ratio for photos with excess background.
+ *   "crop-tighter" – crops 35% off each side, for photos where the subject
+ *                    is small in the frame (e.g. a full-body or ID scan).
+ *
+ * None of this can fix a genuinely unusable photo (masked, extreme angle,
+ * eyes closed) — those still fail and get recorded for manual follow-up.
+ */
+async function buildFaceImageVariant(rawBuffer, variant) {
+  // Auto-orient once up front so crop math works on the visually-correct
+  // (post-EXIF-rotation) dimensions, not the raw sensor orientation.
+  const { data, info } = await sharp(rawBuffer).rotate().toBuffer({ resolveWithObject: true });
+  let pipeline = sharp(data);
+
+  const centerCrop = (fraction) => {
+    const cropW = Math.round(info.width  * (1 - fraction * 2));
+    const cropH = Math.round(info.height * (1 - fraction * 2));
+    const left  = Math.round((info.width  - cropW) / 2);
+    // Bias the crop slightly upward — headshots usually center the face
+    // in the upper two-thirds of the frame, not dead-center vertically.
+    const top   = Math.max(0, Math.round((info.height - cropH) / 2 - info.height * 0.04));
+    return { left, top, width: cropW, height: cropH };
+  };
+
+  switch (variant) {
+    case "enhance":
+      pipeline = pipeline.normalize().sharpen();
+      break;
+    case "crop-tight":
+      pipeline = pipeline.extract(centerCrop(0.18)).normalize();
+      break;
+    case "crop-tighter":
+      pipeline = pipeline.extract(centerCrop(0.35)).normalize().sharpen();
+      break;
+    default:
+      throw new Error(`Unknown face image variant: ${variant}`);
+  }
+
+  return pipeline.jpeg({ quality: 95 }).toBuffer();
+}
+
+const FACE_IMAGE_VARIANTS = ["enhance", "crop-tight", "crop-tighter"];
+
+/**
+ * Delete the existing face record for an FPID so a fresh one can be added.
+ * Tries the same-path query-string DELETE first, then the FDSearch/Delete
+ * body-based form — different Hikvision firmwares expose different ones.
+ */
+async function deleteFaceRecord(client, employeeNo) {
+  const queryPath =
+    `/ISAPI/Intelligent/FDLib/FaceDataRecord?format=json&FDID=1` +
+    `&faceLibType=blackFD&FPID=${encodeURIComponent(String(employeeNo))}`;
+
+  try {
+    return await client.request("DELETE", queryPath);
+  } catch {
+    const body = JSON.stringify({
+      searchResultPosition: 0,
+      maxResults           : 1,
+      faceLibType           : "blackFD",
+      FDID                   : "1",
+      FPID                   : String(employeeNo),
+    });
+    return await client.request("PUT", ISAPI_FACE_DELETE_SEARCH, body);
+  }
+}
+
+/**
+ * Upload one image buffer, transparently hard-replacing an existing face
+ * record when the device refuses a plain add (POST) because this FPID
+ * already has a face on file. This firmware doesn't support PUT-in-place
+ * (see uploadFaceImage), so "replace" means delete the old record then
+ * re-add. Any other rejection is left for the caller to classify/handle.
+ */
+async function tryFaceUpload(client, employeeNo, buffer) {
+  try {
+    return { result: await uploadFaceImage(client, employeeNo, buffer), replaced: false };
+  } catch (err) {
+    if (!isFaceAlreadyExists(err)) throw err;
+
+    try {
+      await deleteFaceRecord(client, employeeNo);
+    } catch (delErr) {
+      console.warn(`       ⚠  Could not delete existing face for ${employeeNo} before re-upload: ${delErr.message}`);
+    }
+
+    return { result: await uploadFaceImage(client, employeeNo, buffer), replaced: true };
+  }
+}
+
+/**
+ * Compress + upload a face photo. Handles two failure classes automatically:
+ *   - deviceUserAlreadyExistFace  → hard-replaces by deleting the existing
+ *     face record then re-adding (see tryFaceUpload) — not a photo
+ *     problem, so no re-processing.
+ *   - a content/modeling rejection (see isFaceContentRejection) → retries
+ *     with re-processed variants (see buildFaceImageVariant).
+ * Any other failure (network, auth, malformed request) is thrown
+ * immediately, unchanged, so normal error handling / logging at the call
+ * sites is unaffected.
+ *
+ * On success the default path is byte-for-byte identical to the previous
+ * compressImage() + uploadFaceImage() call — this only adds behavior for
+ * the failure case.
+ */
+async function uploadFaceImageWithFallback(client, employeeNo, rawBuffer, label, photoState) {
+  const primary = await compressImage(rawBuffer, label);
+  if (!primary) return null;
+
+  try {
+    const { result, replaced } = await tryFaceUpload(client, employeeNo, primary);
+    clearPhotoFailure(photoState, employeeNo);
+    return { result, variant: replaced ? "default (replaced)" : "default", bytes: primary.length };
+  } catch (err) {
+    if (!isFaceContentRejection(err)) throw err;
+
+    console.warn(
+      `       ⚠  ${label}: device rejected default photo ` +
+      `(${err.hikSubStatus || err.message}) — trying enhanced variants…`
+    );
+
+    for (const variant of FACE_IMAGE_VARIANTS) {
+      try {
+        const altRaw = await buildFaceImageVariant(rawBuffer, variant);
+        const altCompressed = await compressImage(altRaw, `${label} (${variant})`);
+        if (!altCompressed) continue;
+
+        const { result, replaced } = await tryFaceUpload(client, employeeNo, altCompressed);
+        console.log(`       ✔  ${label}: accepted using "${variant}" variant${replaced ? " (replaced)" : ""}`);
+        clearPhotoFailure(photoState, employeeNo);
+        return { result, variant: replaced ? `${variant} (replaced)` : variant, bytes: altCompressed.length };
+      } catch (variantErr) {
+        if (!isFaceContentRejection(variantErr)) throw variantErr;
+        // else keep trying the remaining variants
+      }
+    }
+
+    console.warn(`       ✖  ${label}: all variants rejected by device — flagged for manual review`);
+    recordPhotoFailure(photoState, employeeNo, {
+      name        : label,
+      reason      : err.hikSubStatus || err.message,
+      variantsTried: FACE_IMAGE_VARIANTS,
+    });
+    throw err;
   }
 }
 
@@ -1084,12 +1312,14 @@ async function syncDevice(client, cloudPersons, serial, photoState) {
         try {
           const raw = await fetchPhoto(person.photo_url);
           if (raw) {
-            const img = await compressImage(raw, empNo);
-            if (img) {
-              await uploadFaceImage(client, empNo, img);
+            const uploaded = await uploadFaceImageWithFallback(
+              client, empNo, raw, `${empNo} ${person.name}`, photoState
+            );
+            if (uploaded) {
               result.photos++;
               recordPhotoPushed(photoState, serial, empNo, person.photo_url);
-              console.log(`       📷 Photo uploaded for ${empNo}  ${person.name}  (${Math.round(img.length / 1024)}KB)`);
+              const variantNote = uploaded.variant !== "default" ? ` [${uploaded.variant}]` : "";
+              console.log(`       📷 Photo uploaded for ${empNo}  ${person.name}  (${Math.round(uploaded.bytes / 1024)}KB)${variantNote}`);
               if (allKnownDevicesHavePhoto(photoState, empNo, person.photo_url)) {
                 await clearPhotoFlag(empNo, person.type).catch(() => {});
               }
@@ -1136,12 +1366,14 @@ async function syncDevice(client, cloudPersons, serial, photoState) {
         try {
           const raw = await fetchPhoto(person.photo_url);
           if (raw) {
-            const img = await compressImage(raw, empNo);
-            if (img) {
-              await uploadFaceImage(client, empNo, img);
+            const uploaded = await uploadFaceImageWithFallback(
+              client, empNo, raw, `${empNo} ${person.name}`, photoState
+            );
+            if (uploaded) {
               result.photos++;
               recordPhotoPushed(photoState, serial, empNo, person.photo_url);
-              console.log(`       📷 Photo updated for ${empNo}  ${person.name}  (${Math.round(img.length / 1024)}KB)`);
+              const variantNote = uploaded.variant !== "default" ? ` [${uploaded.variant}]` : "";
+              console.log(`       📷 Photo updated for ${empNo}  ${person.name}  (${Math.round(uploaded.bytes / 1024)}KB)${variantNote}`);
               if (allKnownDevicesHavePhoto(photoState, empNo, person.photo_url)) {
                 await clearPhotoFlag(empNo, person.type).catch(() => {});
               }
