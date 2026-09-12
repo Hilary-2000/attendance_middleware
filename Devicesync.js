@@ -83,11 +83,10 @@ const ISAPI_PERSON_DELETE = "/ISAPI/AccessControl/UserInfo/Delete?format=json";
 // DS-K1T342MFX-E1 is a face recognition terminal
 // Uses Intelligent/FDLib path, NOT AccessControl/FaceDataRecord
 const ISAPI_FACE_UPLOAD = "/ISAPI/Intelligent/FDLib/FaceDataRecord?format=json";
-// PUT on the above is rejected (methodNotAllowed) — replacing a face means
-// delete then re-add. Two delete conventions exist across Hikvision
-// firmwares; try the same-path query-string form first, then fall back to
-// the FDSearch/Delete body form. See deleteFaceRecord().
-const ISAPI_FACE_DELETE_SEARCH = "/ISAPI/Intelligent/FDLib/FDSearch/Delete?format=json";
+// Both PUT and DELETE on the above are rejected (methodNotAllowed) for a
+// single record — confirmed by direct probing. Replacing a face means
+// delete-the-person + re-add, not a face-record-level operation.
+// See tryFaceUpload().
 
 /* ================================================================== */
 /*  Digest-Auth (self-contained — no external dependency)              */
@@ -651,10 +650,11 @@ function isFaceContentRejection(err) {
  * Upload a face image for a person on the terminal.
  * Image must be a JPEG Buffer.
  *
- * Note: this device firmware only allows POST here — PUT is rejected with
- * methodNotAllowed ("Method and protocol do not match"), so replacing an
- * existing face means delete-then-add, not modify-in-place. See
- * deleteFaceRecord() / tryFaceUpload().
+ * Note: this device firmware only allows POST here — both PUT and DELETE
+ * on a single record are rejected with methodNotAllowed ("Method and
+ * protocol do not match"), confirmed by direct probing. Replacing an
+ * existing face means deleting and re-adding the whole person, not any
+ * face-record-level operation. See tryFaceUpload().
  */
 async function uploadFaceImage(client, employeeNo, imageBuffer) {
   // DS-K1T342MFX-E1 correct face upload endpoint
@@ -1109,57 +1109,35 @@ async function buildFaceImageVariant(rawBuffer, variant) {
 const FACE_IMAGE_VARIANTS = ["enhance", "crop-tight", "crop-tighter"];
 
 /**
- * Delete the existing face record for an FPID so a fresh one can be added.
- * Tries the same-path query-string DELETE first, then the FDSearch/Delete
- * body-based form — different Hikvision firmwares expose different ones.
- */
-async function deleteFaceRecord(client, employeeNo) {
-  const queryPath =
-    `/ISAPI/Intelligent/FDLib/FaceDataRecord?format=json&FDID=1` +
-    `&faceLibType=blackFD&FPID=${encodeURIComponent(String(employeeNo))}`;
-
-  try {
-    return await client.request("DELETE", queryPath);
-  } catch {
-    const body = JSON.stringify({
-      searchResultPosition: 0,
-      maxResults           : 1,
-      faceLibType           : "blackFD",
-      FDID                   : "1",
-      FPID                   : String(employeeNo),
-    });
-    return await client.request("PUT", ISAPI_FACE_DELETE_SEARCH, body);
-  }
-}
-
-/**
  * Upload one image buffer, transparently hard-replacing an existing face
- * record when the device refuses a plain add (POST) because this FPID
- * already has a face on file. This firmware doesn't support PUT-in-place
- * (see uploadFaceImage), so "replace" means delete the old record then
- * re-add. Any other rejection is left for the caller to classify/handle.
+ * when the device refuses a plain add (POST) because this FPID already has
+ * a face on file.
+ *
+ * Confirmed by direct probing against this firmware (DS-K1T342MFX-E1):
+ * neither DELETE nor PUT on FaceDataRecord for a single record is actually
+ * honored — both come back "methodNotAllowed" despite the FDLib
+ * capabilities response listing those verbs (that capability describes
+ * whole-library management, not per-record operations). The only way to
+ * clear an existing face is to delete the person and re-add them — which
+ * is what deleting via the device touchscreen does under the hood.
  */
-async function tryFaceUpload(client, employeeNo, buffer) {
+async function tryFaceUpload(client, employeeNo, buffer, person) {
   try {
     return { result: await uploadFaceImage(client, employeeNo, buffer), replaced: false };
   } catch (err) {
     if (!isFaceAlreadyExists(err)) throw err;
 
-    try {
-      await deleteFaceRecord(client, employeeNo);
-    } catch (delErr) {
-      console.warn(`       ⚠  Could not delete existing face for ${employeeNo} before re-upload: ${delErr.message}`);
-    }
-
+    await deletePerson(client, employeeNo);
+    await addPerson(client, person);
     return { result: await uploadFaceImage(client, employeeNo, buffer), replaced: true };
   }
 }
 
 /**
  * Compress + upload a face photo. Handles two failure classes automatically:
- *   - deviceUserAlreadyExistFace  → hard-replaces by deleting the existing
- *     face record then re-adding (see tryFaceUpload) — not a photo
- *     problem, so no re-processing.
+ *   - deviceUserAlreadyExistFace  → hard-replaces by deleting the person
+ *     and re-adding them (see tryFaceUpload) — not a photo problem, so no
+ *     re-processing.
  *   - a content/modeling rejection (see isFaceContentRejection) → retries
  *     with re-processed variants (see buildFaceImageVariant).
  * Any other failure (network, auth, malformed request) is thrown
@@ -1170,12 +1148,12 @@ async function tryFaceUpload(client, employeeNo, buffer) {
  * compressImage() + uploadFaceImage() call — this only adds behavior for
  * the failure case.
  */
-async function uploadFaceImageWithFallback(client, employeeNo, rawBuffer, label, photoState) {
+async function uploadFaceImageWithFallback(client, employeeNo, rawBuffer, label, photoState, person) {
   const primary = await compressImage(rawBuffer, label);
   if (!primary) return null;
 
   try {
-    const { result, replaced } = await tryFaceUpload(client, employeeNo, primary);
+    const { result, replaced } = await tryFaceUpload(client, employeeNo, primary, person);
     clearPhotoFailure(photoState, employeeNo);
     return { result, variant: replaced ? "default (replaced)" : "default", bytes: primary.length };
   } catch (err) {
@@ -1192,7 +1170,7 @@ async function uploadFaceImageWithFallback(client, employeeNo, rawBuffer, label,
         const altCompressed = await compressImage(altRaw, `${label} (${variant})`);
         if (!altCompressed) continue;
 
-        const { result, replaced } = await tryFaceUpload(client, employeeNo, altCompressed);
+        const { result, replaced } = await tryFaceUpload(client, employeeNo, altCompressed, person);
         console.log(`       ✔  ${label}: accepted using "${variant}" variant${replaced ? " (replaced)" : ""}`);
         clearPhotoFailure(photoState, employeeNo);
         return { result, variant: replaced ? `${variant} (replaced)` : variant, bytes: altCompressed.length };
@@ -1313,7 +1291,7 @@ async function syncDevice(client, cloudPersons, serial, photoState) {
           const raw = await fetchPhoto(person.photo_url);
           if (raw) {
             const uploaded = await uploadFaceImageWithFallback(
-              client, empNo, raw, `${empNo} ${person.name}`, photoState
+              client, empNo, raw, `${empNo} ${person.name}`, photoState, person
             );
             if (uploaded) {
               result.photos++;
@@ -1367,7 +1345,7 @@ async function syncDevice(client, cloudPersons, serial, photoState) {
           const raw = await fetchPhoto(person.photo_url);
           if (raw) {
             const uploaded = await uploadFaceImageWithFallback(
-              client, empNo, raw, `${empNo} ${person.name}`, photoState
+              client, empNo, raw, `${empNo} ${person.name}`, photoState, person
             );
             if (uploaded) {
               result.photos++;
